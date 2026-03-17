@@ -1,0 +1,103 @@
+import os
+import tempfile
+import streamlit as st
+from dotenv import load_dotenv
+from langchain_openai import AzureChatOpenAI
+from langchain_community.document_loaders import UnstructuredPowerPointLoader
+from langchain.agents import create_agent
+from langchain_core.tools import tool
+
+# 1. Page Configuration
+st.set_page_config(page_title="PPTX Analyst", layout="wide")
+st.title("📊 PowerPoint AI Analyst")
+
+load_dotenv(override=True)
+
+# 2. Model Initialization
+@st.cache_resource
+def get_model():
+    return AzureChatOpenAI(
+        azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+        azure_deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT"),
+        azure_api_version=os.getenv("OPENAI_API_VERSION"),
+        azure_api_key=os.getenv("AZURE_OPENAI_KEY"),
+        model=os.getenv("MODEL_NAME"),
+        temperature=0.0
+    )
+
+# 3. Dynamic Tool Definition
+@tool
+def analyze_pptx_structure(file_path: str):
+    """
+    Uses unstructured to partition the PPTX. 
+    It extracts tables as metadata and text in structured format.
+    """
+    loader = UnstructuredPowerPointLoader(
+        file_path=file_path,
+        mode="elements",
+        strategy="hi-res",
+        infer_table_structure=True,
+    )
+    docs = loader.load()
+    structured_output = []
+    for doc in docs:
+        category = doc.metadata.get("category", "Text")
+        page = doc.metadata.get("page_number", "Unknown")
+        content = doc.metadata.get("text_as_html", doc.page_content)
+        structured_output.append(f"[Slide {page} - {category}] {content}")
+    return "\n".join(structured_output)
+
+# 4. Sidebar - File Upload
+with st.sidebar:
+    st.header("Upload Document")
+    uploaded_file = st.file_uploader("Choose a PowerPoint file", type="pptx")
+    
+    if uploaded_file:
+        # Save to a temp file so the loader can read it from disk
+        with tempfile.NamedTemporaryFile(delete=False, suffix=".pptx") as tmp_file:
+            tmp_file.write(uploaded_file.getvalue())
+            st.session_state['temp_file_path'] = tmp_file.name
+        st.success("File uploaded successfully!")
+
+# 5. Initialize Chat History & Agent
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+llm = get_model()
+agent = create_agent(
+    model=llm,
+    tools=[analyze_pptx_structure],
+    system_prompt=(
+        "You are a PowerPoint analyst. Use 'analyze_pptx_structure' with the provided file path. "
+        "Summarize content, describe plots using NarrativeText, and extract OCR details when asked."
+    )
+)
+
+# 6. Chat Interface
+# Display existing messages
+for message in st.session_state.messages:
+    with st.chat_message(message["role"]):
+        st.markdown(message["content"])
+
+# Chat Input
+if prompt := st.chat_input("Ask something about your presentation..."):
+    if not uploaded_file:
+        st.warning("Please upload a PPTX file first.")
+    else:
+        # Add user message to history
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        # Generate Agent Response
+        with st.chat_message("assistant"):
+            with st.spinner("Analyzing slides..."):
+                # We pass the temp file path into the query context for the agent
+                full_query = f"File path: {st.session_state['temp_file_path']}. Question: {prompt}"
+                
+                response = agent.invoke({"messages": [("user", full_query)]})
+                answer = response["messages"][-1].content
+                st.markdown(answer)
+        
+        # Add assistant message to history
+        st.session_state.messages.append({"role": "assistant", "content": answer})
