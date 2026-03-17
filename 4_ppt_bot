@@ -1,0 +1,122 @@
+import os
+import tempfile
+import streamlit as st
+from dotenv import load_dotenv
+from langchain_openai import AzureChatOpenAI
+from langchain_community.document_loaders import UnstructuredPowerPointLoader
+from langchain.agents import create_agent
+from langchain_core.tools import tool
+
+# --- App Setup ---
+st.set_page_config(page_title="Multi-PPT AI Analyst", layout="wide")
+st.title("📂 Multi-PPT AI Analyst & Comparison Tool")
+
+load_dotenv(override=True)
+
+# Helper: Clear Chat
+if st.sidebar.button("Clear History"):
+    st.session_state.messages = []
+    st.rerun()
+
+@st.cache_resource
+def get_model():
+    return AzureChatOpenAI(
+        azure_endpoint=os.getenv("AZURE_OPENAI_ENDPOINT"),
+        azure_deployment=os.getenv("AZURE_OPENAI_DEPLOYMENT"),
+        azure_api_version=os.getenv("OPENAI_API_VERSION"),
+        azure_api_key=os.getenv("AZURE_OPENAI_KEY"),
+        model=os.getenv("MODEL_NAME"),
+        temperature=0.0
+    )
+
+# --- Enhanced Tool for Multi-File Analysis ---
+@tool
+def analyze_multiple_ppts(file_paths_str: str):
+    """
+    Analyzes one or more PowerPoint files. 
+    Input should be a comma-separated string of local file paths.
+    Returns structured text with [File Name][Slide X] for every chunk.
+    """
+    paths = [p.strip() for p in file_paths_str.split(",")]
+    combined_output = []
+
+    for path in paths:
+        file_name = os.path.basename(path)
+        try:
+            loader = UnstructuredPowerPointLoader(
+                file_path=path,
+                mode="elements",
+                strategy="hi-res"
+            )
+            docs = loader.load()
+            
+            for doc in docs:
+                page = doc.metadata.get("page_number", "??")
+                content = doc.page_content
+                # We prefix the filename and page number for the LLM's reference
+                combined_output.append(f"SOURCE: {file_name} | SLIDE: {page}\nCONTENT: {content}\n---")
+        except Exception as e:
+            combined_output.append(f"Error reading {file_name}: {str(e)}")
+
+    return "\n".join(combined_output)
+
+# --- Sidebar: Multi-File Upload ---
+with st.sidebar:
+    st.header("Upload Files")
+    uploaded_files = st.file_uploader(
+        "Upload PowerPoint files", 
+        type="pptx", 
+        accept_multiple_files=True
+    )
+    
+    temp_paths = []
+    if uploaded_files:
+        for uploaded_file in uploaded_files:
+            with tempfile.NamedTemporaryFile(delete=False, suffix=f"_{uploaded_file.name}") as tmp:
+                tmp.write(uploaded_file.getvalue())
+                temp_paths.append(tmp.name)
+        st.session_state['temp_paths'] = temp_paths
+        st.success(f"{len(uploaded_files)} files uploaded.")
+
+# --- Chat Session & Agent ---
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+llm = get_model()
+agent = create_agent(
+    model=llm,
+    tools=[analyze_multiple_ppts],
+    system_prompt=(
+        "You are an expert document analyst. You can compare multiple PowerPoint files. "
+        "When answering, you MUST cite the specific filename and slide number for every claim you make. "
+        "Example: 'According to Project_A.pptx (Slide 4), the budget is $1M.' "
+        "If asked to compare, create a structured comparison between the files."
+    )
+)
+
+# --- Chat Display ---
+for message in st.session_state.messages:
+    if isinstance(message, dict) and "role" in message:
+        with st.chat_message(message["role"]):
+            st.markdown(message["content"])
+
+# --- Chat Input ---
+if prompt := st.chat_input("Ask about your PPTs or compare them..."):
+    if not uploaded_files:
+        st.error("Please upload at least one PPTX file.")
+    else:
+        st.session_state.messages.append({"role": "user", "content": prompt})
+        with st.chat_message("user"):
+            st.markdown(prompt)
+
+        with st.chat_message("assistant"):
+            with st.spinner("Analyzing across documents..."):
+                # Pass all temp paths as a comma-separated string to the tool
+                all_paths = ",".join(st.session_state['temp_paths'])
+                query_with_context = f"Analyze these files: {all_paths}. Question: {prompt}"
+                
+                result = agent.invoke({"messages": [("user", query_with_context)]})
+                answer = result["messages"][-1].content
+                
+                st.markdown(answer)
+                st.session_state.messages.append({"role": "assistant", "content": answer})
