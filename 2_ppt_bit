@@ -1,0 +1,121 @@
+import os
+import streamlit as st
+from dotenv import load_dotenv
+from langchain_openai import AzureChatOpenAI
+from langchain_community.document_loaders import UnstructuredPowerPointLoader
+
+# --- LOAD ENV ---
+load_dotenv(override=True)
+
+# --- CONFIG ---
+os.environ["AZURE_OPENAI_API_KEY"] = os.getenv("AZURE_OPENAI_API_KEY")
+os.environ["AZURE_OPENAI_ENDPOINT"] = os.getenv("AZURE_OPENAI_ENDPOINT")
+os.environ["OPENAI_API_VERSION"] = os.getenv("OPENAI_API_VERSION")
+
+AZURE_OPENAI_DEPLOYMENT = os.getenv("AZURE_OPENAI_DEPLOYMENT")
+
+# --- UI ---
+st.set_page_config(page_title="PPT Analyst", layout="wide")
+st.title("📊 PPT Analyst (Sidebar Upload Version)")
+
+# --- LLM ---
+llm = AzureChatOpenAI(
+    azure_deployment=AZURE_OPENAI_DEPLOYMENT,
+    temperature=0
+)
+
+# --- FUNCTION: EXTRACT PPT ---
+def extract_ppt_content(file_bytes):
+    temp_path = "temp.pptx"
+
+    with open(temp_path, "wb") as f:
+        f.write(file_bytes)
+
+    loader = UnstructuredPowerPointLoader(
+        temp_path,
+        mode="elements",
+        strategy="hi_res",
+        infer_table_structure=True
+    )
+
+    docs = loader.load()
+
+    output = []
+    for d in docs:
+        slide = d.metadata.get("page_number", "?")
+        category = d.metadata.get("category", "Text")
+        content = d.metadata.get("text_as_html", d.page_content)
+
+        output.append(f"[Slide {slide}][{category}] {content}")
+
+    return "\n".join(output[:300])  # limit tokens
+
+
+# --- SIDEBAR FILE UPLOAD ---
+st.sidebar.header("📂 Upload PPT")
+
+uploaded_file = st.sidebar.file_uploader(
+    "Upload your PPTX file",
+    type=["pptx"]
+)
+
+if uploaded_file:
+    file_bytes = uploaded_file.read()
+
+    with st.spinner("Processing PPT..."):
+        st.session_state.ppt_content = extract_ppt_content(file_bytes)
+
+    st.sidebar.success(f"✅ Loaded: {uploaded_file.name}")
+
+# --- SESSION ---
+if "messages" not in st.session_state:
+    st.session_state.messages = []
+
+# --- DISPLAY CHAT ---
+for msg in st.session_state.messages:
+    with st.chat_message(msg["role"]):
+        st.markdown(msg["content"])
+
+# --- CHAT INPUT ---
+user_input = st.chat_input("Ask something about the PPT...")
+
+if user_input:
+    # Save user message
+    st.session_state.messages.append({"role": "user", "content": user_input})
+
+    with st.chat_message("user"):
+        st.markdown(user_input)
+
+    with st.chat_message("assistant"):
+
+        if "ppt_content" not in st.session_state:
+            st.error("❌ Please upload a PPT from the sidebar first.")
+        else:
+            with st.spinner("Analyzing..."):
+
+                try:
+                    response = llm.invoke(
+                        f"""
+                        You are a PPT analyst.
+
+                        PPT Content:
+                        {st.session_state.ppt_content}
+
+                        User Question:
+                        {user_input}
+
+                        Answer clearly and structured.
+                        """
+                    )
+
+                    answer = response.content
+
+                except Exception as e:
+                    answer = f"⚠️ Error: {str(e)}"
+
+                st.markdown(answer)
+
+                st.session_state.messages.append({
+                    "role": "assistant",
+                    "content": answer
+                })
